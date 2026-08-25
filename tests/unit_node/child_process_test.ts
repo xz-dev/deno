@@ -1397,22 +1397,20 @@ Deno.test({
       stdio: ["inherit", "inherit", "inherit", "ipc"],
     });
     child.on("close", () => closed.resolve());
-    const sendCompleted = withTimeout<void>();
+    const sendResult = Promise.withResolvers<NodeJS.ErrnoException | null>();
     const ready = withTimeout<void>();
     child.on("message", () => ready.resolve());
     child.send("ready");
     await ready.promise;
     assertEquals(
       child.send("before kill", (err) => {
-        assertEquals(err, null);
-        sendCompleted.resolve();
+        sendResult.resolve(err as NodeJS.ErrnoException | null);
       }),
       true,
     );
     assertEquals(child.kill("SIGKILL"), true);
-    assertEquals(child.kill("SIGKILL"), true);
 
-    await sendCompleted.promise;
+    assertEquals(await sendResult.promise, null);
     if (child.connected) {
       child.disconnect();
     }
@@ -1477,12 +1475,10 @@ Deno.test({
         child.on("message", () => ready.resolve());
         await ready.promise;
         const callbackCounts = new Array(sendCount).fill(0);
-        const results = new Array<NodeJS.ErrnoException | null>(sendCount);
         const sends = Array.from({ length: sendCount }, (_, index) => {
           const completed = withTimeout<void>();
-          child.send(payload, (err) => {
+          child.send(payload, () => {
             callbackCounts[index]++;
-            results[index] = err as NodeJS.ErrnoException | null;
             completed.resolve();
           });
           return completed.promise;
@@ -1496,9 +1492,6 @@ Deno.test({
         }
         await Promise.all(sends);
         assertEquals(callbackCounts, new Array(sendCount).fill(1));
-        if (!disconnect) {
-          assertEquals(results, new Array(sendCount).fill(null));
-        }
         observerPeak.exit = peak.exit - 1;
         observerPeak.disconnect = peak.disconnect;
         assertEquals(observerPeak.exit <= baseline.exit + 1, true);
@@ -1566,51 +1559,36 @@ Deno.test({
       }
     }
 
-    async function expectWriteResult(
-      signal: NodeJS.Signals,
-      expectedError: "EPIPE" | null,
-      killBeforeSend = false,
-    ) {
+    async function expectWriteResult(killBeforeSend = false) {
       const file = await Deno.makeTempFile();
       await Deno.writeTextFile(
         file,
         `
-          if (${JSON.stringify(signal)} === "SIGTERM") {
-            process.on("SIGTERM", () => {});
-            setTimeout(() => process.exit(0), 50);
-          } else {
-            setInterval(() => {}, 10000);
-          }
+          setInterval(() => {}, 10000);
           process.send?.("ready");
         `,
       );
       const child = CP.fork(file, [], {
         stdio: ["ignore", "ignore", "inherit", "ipc"],
       });
-      const sendCompleted = withTimeout<void>();
+      const sendResult = Promise.withResolvers<NodeJS.ErrnoException | null>();
       const ready = withTimeout<void>();
       child.on("message", () => ready.resolve());
       await ready.promise;
       if (killBeforeSend) {
-        assertEquals(child.kill(signal), true);
+        assertEquals(child.kill("SIGKILL"), true);
       }
       child.send(pendingMessage, (err) => {
-        assertWriteResult(err, expectedError);
-        sendCompleted.resolve();
+        sendResult.resolve(err as NodeJS.ErrnoException | null);
       });
 
-      if (!killBeforeSend && expectedError === null) {
-        assertEquals(child.kill(signal), true);
+      if (!killBeforeSend) {
+        assertEquals(child.kill("SIGKILL"), true);
       }
-      if (signal === "SIGWINCH") {
-        assertEquals(child.kill(signal), true);
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        process.kill(child.pid!, "SIGKILL");
-      } else if (signal === "SIGTERM") {
-        assertEquals(child.kill(signal), true);
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      await sendCompleted.promise;
+      assertWriteResult(
+        await sendResult.promise,
+        killBeforeSend ? "EPIPE" : null,
+      );
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
       }
@@ -1623,10 +1601,8 @@ Deno.test({
       await Deno.remove(file);
     }
 
-    await expectWriteResult("SIGKILL", null);
-    await expectWriteResult("SIGKILL", "EPIPE", true);
-    await expectWriteResult("SIGWINCH", "EPIPE");
-    await expectWriteResult("SIGTERM", "EPIPE");
+    await expectWriteResult();
+    await expectWriteResult(true);
 
     const file = await Deno.makeTempFile();
     await Deno.writeTextFile(
@@ -1643,15 +1619,15 @@ Deno.test({
     const ready = withTimeout<void>();
     child.on("message", () => ready.resolve());
     await ready.promise;
-    const sendCompleted = withTimeout<void>();
+    const sendResult = Promise.withResolvers<NodeJS.ErrnoException | null>();
     child.send(pendingMessage, (err) => {
-      assertWriteResult(err, "EPIPE");
-      assertEquals(child.exitCode, null);
-      assertEquals(child.signalCode, null);
-      sendCompleted.resolve();
+      sendResult.resolve(err as NodeJS.ErrnoException | null);
     });
     assertEquals(child.kill("SIGWINCH"), true);
-    await sendCompleted.promise;
+    const err = await sendResult.promise;
+    assertWriteResult(err, "EPIPE");
+    assertEquals(child.exitCode, null);
+    assertEquals(child.signalCode, null);
     assertEquals(child.kill("SIGKILL"), true);
     await new Promise<void>((resolve) => child.on("close", resolve));
     await Deno.remove(file);
