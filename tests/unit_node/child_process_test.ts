@@ -1382,30 +1382,280 @@ Deno.test(async function childProcessExitsGracefully() {
   await p.promise;
 });
 
-Deno.test(async function killMultipleTimesNoError() {
-  const loop = `
-    while (true) {
-      await new Promise((resolve) => setTimeout(resolve, 10000));
+Deno.test({
+  name: "[node/child_process] send before SIGKILL completes successfully",
+  async fn() {
+    const loop = `
+      process.on("message", (message) => process.send(message));
+      setInterval(() => {}, 10000);
+    `;
+
+    const closed = withTimeout<void>();
+    const file = await Deno.makeTempFile();
+    await Deno.writeTextFile(file, loop);
+    const child = CP.fork(file, [], {
+      stdio: ["inherit", "inherit", "inherit", "ipc"],
+    });
+    child.on("close", () => closed.resolve());
+    const sendCompleted = withTimeout<void>();
+    const ready = withTimeout<void>();
+    child.on("message", () => ready.resolve());
+    child.send("ready");
+    await ready.promise;
+    assertEquals(
+      child.send("before kill", (err) => {
+        assertEquals(err, null);
+        sendCompleted.resolve();
+      }),
+      true,
+    );
+    assertEquals(child.kill("SIGKILL"), true);
+    assertEquals(child.kill("SIGKILL"), true);
+
+    await sendCompleted.promise;
+    if (child.connected) {
+      child.disconnect();
     }
-  `;
+    await closed.promise;
+  },
+});
 
-  const timeout = withTimeout<void>();
-  const file = await Deno.makeTempFile();
-  await Deno.writeTextFile(file, loop);
-  const child = CP.fork(file, [], {
-    stdio: ["inherit", "inherit", "inherit", "ipc"],
-  });
-  child.on("close", () => {
-    timeout.resolve();
-  });
-  assertEquals(child.kill(), true);
-  child.kill();
+Deno.test({
+  name:
+    "[node/child_process] concurrent IPC failures share termination listeners",
+  ignore: Deno.build.os === "windows",
+  async fn() {
+    const sendCount = 16;
+    const payload = { data: "x".repeat(1024 * 1024) };
 
-  // Sending a signal does not implicitly disconnect the IPC channel.
-  assertEquals(child.connected, true);
-  child.disconnect();
+    async function run(disconnect: boolean) {
+      const file = await Deno.makeTempFile();
+      await Deno.writeTextFile(
+        file,
+        disconnect
+          ? `
+            process.send?.("ready");
+            process.on("message", (message) => {
+              if (message === "disconnect") process.disconnect();
+            });
+            setInterval(() => {}, 10000);
+          `
+          : `
+            process.send?.("ready");
+            setInterval(() => {}, 10000);
+          `,
+      );
+      const child = CP.fork(file, [], {
+        stdio: ["ignore", "ignore", "inherit", "ipc"],
+      });
+      const baseline = {
+        exit: child.listenerCount("exit"),
+        disconnect: child.listenerCount("disconnect"),
+      };
+      const exited = Promise.withResolvers<void>();
+      child.once("exit", () => exited.resolve());
+      const peak = { ...baseline };
+      const observerPeak = {
+        exit: baseline.exit,
+        disconnect: baseline.disconnect,
+      };
+      const warnings: Error[] = [];
+      const onWarning = (warning: Error) => warnings.push(warning);
+      const onNewListener = (event: string) => {
+        if (event === "exit" || event === "disconnect") {
+          peak[event] = Math.max(
+            peak[event],
+            child.listenerCount(event) + 1,
+          );
+        }
+      };
+      process.on("warning", onWarning);
+      child.on("newListener", onNewListener);
 
-  await timeout.promise;
+      try {
+        const ready = withTimeout<void>();
+        child.on("message", () => ready.resolve());
+        await ready.promise;
+        const callbackCounts = new Array(sendCount).fill(0);
+        const results = new Array<NodeJS.ErrnoException | null>(sendCount);
+        const sends = Array.from({ length: sendCount }, (_, index) => {
+          const completed = withTimeout<void>();
+          child.send(payload, (err) => {
+            callbackCounts[index]++;
+            results[index] = err as NodeJS.ErrnoException | null;
+            completed.resolve();
+          });
+          return completed.promise;
+        });
+        assertEquals(child.kill("SIGWINCH"), true);
+        if (disconnect) {
+          child.send("disconnect");
+        } else {
+          assertEquals(child.kill("SIGKILL"), true);
+          assertEquals(child.kill("SIGKILL"), true);
+        }
+        await Promise.all(sends);
+        assertEquals(callbackCounts, new Array(sendCount).fill(1));
+        if (!disconnect) {
+          assertEquals(results, new Array(sendCount).fill(null));
+        }
+        observerPeak.exit = peak.exit - 1;
+        observerPeak.disconnect = peak.disconnect;
+        assertEquals(observerPeak.exit <= baseline.exit + 1, true);
+        assertEquals(observerPeak.disconnect <= baseline.disconnect + 1, true);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assertEquals(
+          warnings.some((warning) =>
+            warning.name === "MaxListenersExceededWarning" &&
+            (warning as Error & { emitter?: unknown }).emitter === child
+          ),
+          false,
+        );
+        if (
+          disconnect && child.exitCode === null && child.signalCode === null
+        ) {
+          child.kill("SIGKILL");
+        }
+        await new Promise<void>((resolve) => {
+          if (child.exitCode !== null || child.signalCode !== null) {
+            resolve();
+          } else {
+            child.once("exit", () => resolve());
+          }
+        });
+        await exited.promise;
+        if (child.connected) {
+          child.disconnect();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assertEquals(child.listenerCount("exit"), baseline.exit);
+        assertEquals(
+          child.listenerCount("disconnect"),
+          baseline.disconnect,
+        );
+      } finally {
+        process.removeListener("warning", onWarning);
+        child.removeListener("newListener", onNewListener);
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+        await Deno.remove(file);
+      }
+    }
+
+    await run(false);
+    await run(true);
+  },
+});
+
+Deno.test({
+  name: "[node/child_process] IPC write errors follow actual termination",
+  ignore: Deno.build.os === "windows",
+  async fn() {
+    const pendingMessage = { data: "x".repeat(32 * 1024 * 1024) };
+    function assertWriteResult(
+      err: NodeJS.ErrnoException | null,
+      expectedError: "EPIPE" | null,
+    ) {
+      if (expectedError === null) {
+        assertEquals(err, null);
+      } else {
+        assert(err);
+        assertEquals(err.code, expectedError);
+        assertEquals(err.syscall, "write");
+      }
+    }
+
+    async function expectWriteResult(
+      signal: NodeJS.Signals,
+      expectedError: "EPIPE" | null,
+      killBeforeSend = false,
+    ) {
+      const file = await Deno.makeTempFile();
+      await Deno.writeTextFile(
+        file,
+        `
+          if (${JSON.stringify(signal)} === "SIGTERM") {
+            process.on("SIGTERM", () => {});
+            setTimeout(() => process.exit(0), 50);
+          } else {
+            setInterval(() => {}, 10000);
+          }
+          process.send?.("ready");
+        `,
+      );
+      const child = CP.fork(file, [], {
+        stdio: ["ignore", "ignore", "inherit", "ipc"],
+      });
+      const sendCompleted = withTimeout<void>();
+      const ready = withTimeout<void>();
+      child.on("message", () => ready.resolve());
+      await ready.promise;
+      if (killBeforeSend) {
+        assertEquals(child.kill(signal), true);
+      }
+      child.send(pendingMessage, (err) => {
+        assertWriteResult(err, expectedError);
+        sendCompleted.resolve();
+      });
+
+      if (!killBeforeSend && expectedError === null) {
+        assertEquals(child.kill(signal), true);
+      }
+      if (signal === "SIGWINCH") {
+        assertEquals(child.kill(signal), true);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        process.kill(child.pid!, "SIGKILL");
+      } else if (signal === "SIGTERM") {
+        assertEquals(child.kill(signal), true);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await sendCompleted.promise;
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      if (child.connected) {
+        child.disconnect();
+      }
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve) => child.on("close", resolve));
+      }
+      await Deno.remove(file);
+    }
+
+    await expectWriteResult("SIGKILL", null);
+    await expectWriteResult("SIGKILL", "EPIPE", true);
+    await expectWriteResult("SIGWINCH", "EPIPE");
+    await expectWriteResult("SIGTERM", "EPIPE");
+
+    const file = await Deno.makeTempFile();
+    await Deno.writeTextFile(
+      file,
+      `
+        process.send?.("ready");
+        setTimeout(() => process.disconnect(), 10);
+        setInterval(() => {}, 10000);
+      `,
+    );
+    const child = CP.fork(file, [], {
+      stdio: ["ignore", "ignore", "inherit", "ipc"],
+    });
+    const ready = withTimeout<void>();
+    child.on("message", () => ready.resolve());
+    await ready.promise;
+    const sendCompleted = withTimeout<void>();
+    child.send(pendingMessage, (err) => {
+      assertWriteResult(err, "EPIPE");
+      assertEquals(child.exitCode, null);
+      assertEquals(child.signalCode, null);
+      sendCompleted.resolve();
+    });
+    assertEquals(child.kill("SIGWINCH"), true);
+    await sendCompleted.promise;
+    assertEquals(child.kill("SIGKILL"), true);
+    await new Promise<void>((resolve) => child.on("close", resolve));
+    await Deno.remove(file);
+  },
 });
 
 Deno.test({

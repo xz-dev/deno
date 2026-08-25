@@ -15,6 +15,7 @@ const {
   DataViewPrototypeGetByteLength,
   DataViewPrototypeGetByteOffset,
   Error,
+  FunctionPrototypeBind,
   ObjectEntries,
   ObjectKeys,
   ObjectPrototype,
@@ -217,6 +218,8 @@ function stdioStringToArray(
 const kClosesNeeded = Symbol("_closesNeeded");
 const kClosesReceived = Symbol("_closesReceived");
 const kCanDisconnect = Symbol("_canDisconnect");
+const kSignalGeneration = Symbol("_signalGeneration");
+const kWasTerminatedBySignal = Symbol("_wasTerminatedBySignal");
 const kChildStdioUsedAsInput = Symbol("childStdioUsedAsInput");
 const childStdioStreamsByFd = new SafeMap();
 let emittedShellDeprecation = false;
@@ -306,6 +309,8 @@ class ChildProcess extends EventEmitter {
   disconnect;
 
   #process;
+  #killSignalGenerations = new SafeMap();
+  [kSignalGeneration] = 0;
   #windowsSignalFallback: string | null = null;
   #spawned = PromiseWithResolvers();
   [kClosesNeeded] = 1;
@@ -874,6 +879,8 @@ class ChildProcess extends EventEmitter {
     }
 
     this.#recordWindowsSignalFallback(signalName);
+    this[kSignalGeneration]++;
+    this.#killSignalGenerations.set(signalName, this[kSignalGeneration]);
     this.killed = true;
     return true;
   }
@@ -882,6 +889,18 @@ class ChildProcess extends EventEmitter {
     if (isWindows) {
       this.#windowsSignalFallback = signalName;
     }
+  }
+
+  [kWasTerminatedBySignal](signalGeneration: number) {
+    const matchingGeneration = this.#killSignalGenerations.get(
+      this.signalCode,
+    );
+    const aliasGeneration = this.signalCode === "SIGABRT"
+      ? this.#killSignalGenerations.get("SIGIOT")
+      : undefined;
+    return (matchingGeneration !== undefined &&
+      signalGeneration < matchingGeneration) ||
+      (aliasGeneration !== undefined && signalGeneration < aliasGeneration);
   }
 
   [SymbolDispose]() {
@@ -2504,6 +2523,20 @@ function createIpcHandle(message, rawFd) {
   return undefined;
 }
 
+function reportIpcWriteError(target, callback, err) {
+  // Match Node: errors raised from a failed IPC send carry
+  // `syscall: "write"`. Tests like `test-cluster-concurrent-disconnect`
+  // assert on this when racing send() against worker disconnect.
+  if (err && typeof err === "object" && !err.syscall) {
+    err.syscall = "write";
+  }
+  if (typeof callback === "function") {
+    nextTick(callback, err);
+  } else {
+    nextTick(() => target.emit("error", err));
+  }
+}
+
 function setupChannel(
   target,
   ipc,
@@ -2514,6 +2547,15 @@ function setupChannel(
   const { Socket: DgramSocket } = lazyDgram();
   const control = new Control(ipc, serialization);
   target.channel = control;
+  let wasTerminatedBy = null;
+  let signalGeneration = null;
+  if (ObjectPrototypeIsPrototypeOf(ChildProcess.prototype, target)) {
+    wasTerminatedBy = FunctionPrototypeBind(
+      target[kWasTerminatedBySignal],
+      target,
+    );
+    signalGeneration = () => target[kSignalGeneration];
+  }
 
   if (!hasSetBufferConstructor) {
     op_node_ipc_buffer_constructor(Buffer, FastBuffer.prototype);
@@ -2670,7 +2712,74 @@ function setupChannel(
     return dispatch(message, handleInfo, callback);
   }
 
+  let pendingWriteFailures = null;
+  let observingWriteFailureTermination = false;
+
+  function settleWriteFailure(item, exited) {
+    if (exited && wasTerminatedBy(item.signalGeneration)) {
+      if (typeof item.callback === "function") {
+        // Node treats an IPC write accepted before child.kill() as
+        // successful when that signal actually terminates the child.
+        nextTick(item.callback, null);
+      }
+    } else {
+      reportIpcWriteError(target, item.callback, item.err);
+    }
+  }
+
+  function drainWriteFailures(exited) {
+    if (!observingWriteFailureTermination) {
+      return;
+    }
+    observingWriteFailureTermination = false;
+    target.removeListener("exit", onWriteFailureExit);
+    target.removeListener("disconnect", onWriteFailureDisconnect);
+    const pending = pendingWriteFailures;
+    pendingWriteFailures = null;
+    for (const item of new SafeArrayIterator(pending)) {
+      settleWriteFailure(item, exited);
+    }
+  }
+
+  function onWriteFailureExit() {
+    drainWriteFailures(true);
+  }
+
+  function onWriteFailureDisconnect() {
+    drainWriteFailures(false);
+  }
+
+  function deferWriteFailure(signalGeneration, callback, err) {
+    const item = { signalGeneration, callback, err };
+    if (target.exitCode !== null || target.signalCode !== null) {
+      settleWriteFailure(item, true);
+      return;
+    }
+    if (!target.connected) {
+      settleWriteFailure(item, false);
+      return;
+    }
+    if (pendingWriteFailures === null) {
+      pendingWriteFailures = [];
+    }
+    ArrayPrototypePush(pendingWriteFailures, item);
+    if (!observingWriteFailureTermination) {
+      observingWriteFailureTermination = true;
+      target.once("exit", onWriteFailureExit);
+      target.once("disconnect", onWriteFailureDisconnect);
+      // Cover a terminal event that happened before the observers were added.
+      if (target.exitCode !== null || target.signalCode !== null) {
+        drainWriteFailures(true);
+      } else if (!target.connected) {
+        drainWriteFailures(false);
+      }
+    }
+  }
+
   function dispatch(message, handleInfo, callback) {
+    const signalGenerationAtDispatch = signalGeneration
+      ? signalGeneration()
+      : 0;
     if (handleInfo) {
       // Start queueing subsequent sends until the ACK arrives.
       handleQueue = [];
@@ -2719,22 +2828,19 @@ function setupChannel(
           }
         }
         if (
-          ObjectPrototypeIsPrototypeOf(Deno.errors.Interrupted.prototype, err)
+          ObjectPrototypeIsPrototypeOf(
+            Deno.errors.Interrupted.prototype,
+            err,
+          )
         ) {
           // Channel closed on us mid-write.
+        } else if (
+          signalGeneration === null ||
+          signalGenerationAtDispatch === signalGeneration()
+        ) {
+          reportIpcWriteError(target, callback, err);
         } else {
-          // Match Node: errors raised from a failed IPC send carry
-          // `syscall: "write"`. Tests like `test-cluster-concurrent-disconnect`
-          // assert on this when racing send() against worker disconnect.
-          const errAny = err;
-          if (errAny && typeof errAny === "object" && !errAny.syscall) {
-            errAny.syscall = "write";
-          }
-          if (typeof callback === "function") {
-            nextTick(callback, err);
-          } else {
-            nextTick(() => target.emit("error", err));
-          }
+          deferWriteFailure(signalGenerationAtDispatch, callback, err);
         }
       },
     );
